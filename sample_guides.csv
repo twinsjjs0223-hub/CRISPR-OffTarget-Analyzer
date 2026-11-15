@@ -1,4 +1,4 @@
-name,gRNA_RNA
-perfect_match,GAGUCCGAGCAGAAGAAGAA
-GU_mismatch,GAGUCCGAGUAGAAGAAGAA
-distal_mismatch,AAGUCCGAGCAGAAGAAGAA
+guide_id,guide_rna,description
+gRNA_1,GAGUCCGAGCAGAAGAAGAA,완전 일치 예시
+gRNA_2,GAGUCCGAGCAGAAGAAGAU,말단 1개 불일치 예시
+gRNA_3,GAGUCCGAGCAGAAGCAGAA,내부 1개 불일치 예시
