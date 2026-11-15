@@ -1,196 +1,139 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from io import StringIO
+import re
 
 st.set_page_config(page_title="CRISPR Off-target Analyzer", page_icon="🧬", layout="wide")
-
 st.title("🧬 CRISPR Off-target Analyzer")
-st.caption("gRNA 후보의 서열 불일치, 열역학적 안정성 추정 및 절단 관련 지표를 비교하는 교육·탐구용 시뮬레이터")
+st.caption("SpCas9 · RNA guide (U) · DNA protospacer comparison · educational prototype")
 
-st.info(
-    "이 앱은 교육·탐구용 프로토타입입니다. 아래 CFD-like 점수와 ΔΔG는 실제 CFD 모델 또는 "
-    "실험적으로 검증된 RNA-DNA 최근접 이웃 계산값이 아닌, 경향을 설명하기 위한 휴리스틱 추정치입니다. "
-    "실제 오프타겟 안전성·절단 여부 판단이나 임상·실험 설계에 사용하면 안 됩니다."
+st.warning(
+    "탐구용 프로토타입입니다. 입력 서열만으로 실제 유전체의 모든 오프타겟 위치를 찾거나 "
+    "세포 내 절단 여부를 확정하지 않습니다. CFD 및 ΔΔG는 아래에서 데이터 출처와 계산 수준을 구분해 표시합니다."
 )
 
-# Illustrative, intentionally transparent mismatch penalties.
-# Values are heuristic teaching parameters, not measured thermodynamic parameters.
-BASE_PENALTY = {
-    "A": {"A": 1.00, "C": 1.15, "G": 0.95, "T": 0.90},
-    "C": {"A": 1.10, "C": 1.00, "G": 0.90, "T": 1.05},
-    "G": {"A": 0.95, "C": 0.85, "G": 1.00, "T": 0.70},
-    "T": {"A": 0.90, "C": 1.00, "G": 0.65, "T": 1.00},
-}
-TRANSITIONS = {("A","G"),("G","A"),("C","T"),("T","C")}
+st.markdown("""
+**서열 방향 규칙 (중요)**  
+- 표적 DNA 입력: PAM이 붙어 있는 **비표적(non-target) 가닥의 protospacer 20 nt**, 5′→3′  
+- gRNA 입력: **RNA spacer 20 nt**, 5′→3′, 염기는 A/U/G/C  
+- 따라서 완전 일치하는 gRNA는 표적 DNA의 T를 U로 바꾼 서열과 같습니다.  
+- 표적 DNA의 반대 가닥을 입력하려면 먼저 역상보 서열로 바꿔야 합니다.
+""")
 
-def clean_seq(seq):
-    return "".join(c for c in seq.upper().replace("U", "T") if c in "ACGT")
+def clean_dna(s):
+    s = re.sub(r'\s+', '', str(s)).upper()
+    if not s or set(s) - set("ACGT"):
+        raise ValueError("DNA 서열에는 A, C, G, T만 사용할 수 있습니다.")
+    return s
 
-def mismatch_details(target, guide):
-    if len(target) != len(guide):
-        raise ValueError("표적 DNA와 gRNA는 같은 길이여야 합니다.")
-    out = []
-    n = len(target)
-    for i, (t, g) in enumerate(zip(target, guide), start=1):
-        if t != g:
-            # Position 1 is PAM-distal; position n is PAM-proximal in this app's convention.
-            pam_prox = i / n
-            if (t, g) in TRANSITIONS:
-                pair_penalty = 0.78
-            else:
-                pair_penalty = 1.0
-            # PAM-proximal mismatches receive larger heuristic penalty.
-            positional = 0.55 + 0.9 * pam_prox
-            penalty = pair_penalty * positional
-            ddg = BASE_PENALTY[t][g] * positional
-            out.append({
-                "position": i, "target_base": t, "guide_base": g,
-                "mismatch": f"{t}:{g}", "region": "PAM-proximal" if i > n*0.6 else "PAM-distal",
-                "heuristic_penalty": penalty, "heuristic_ddG": ddg
+def clean_rna(s):
+    s = re.sub(r'\s+', '', str(s)).upper()
+    if not s or set(s) - set("ACGU"):
+        raise ValueError("gRNA는 RNA이므로 A, U, G, C만 사용할 수 있습니다. T는 U로 바꿔 입력하세요.")
+    return s
+
+# Explicit teaching weights only. Not the published CFD matrix.
+# position 20 is PAM-proximal in the convention used by Doench CFD.
+def teaching_mismatch_weight(rna, dna, pos):
+    base = {
+        ("G","T"):0.87, ("G","A"):0.67, ("C","T"):0.87,
+        ("A","G"):0.75, ("U","C"):0.70, ("C","A"):0.60,
+        ("A","C"):0.55, ("U","G"):0.55, ("G","C"):0.50,
+        ("C","G"):0.45, ("A","U"):0.60, ("U","A"):0.60
+    }.get((rna,dna), 0.50)
+    # Transparent positional modifier for demonstration, not empirical CFD.
+    position_factor = 1.0 - 0.012 * (pos-1)
+    return max(0.05, min(1.0, base * position_factor))
+
+def analyze(target_dna, guide_rna, pam):
+    if len(target_dna) != 20 or len(guide_rna) != 20:
+        raise ValueError("현재 버전은 protospacer와 gRNA spacer 각각 20 nt를 요구합니다.")
+    # RNA guide pairs with target strand; provided DNA is the non-target strand
+    # and therefore has the same sequence as guide after T->U conversion.
+    target_as_rna = target_dna.replace("T","U")
+    mismatches=[]
+    cfd_like=1.0
+    ddg_proxy=0.0
+    for i,(r,d) in enumerate(zip(guide_rna,target_as_rna), start=1):
+        if r != d:
+            w=teaching_mismatch_weight(r,d,i)
+            cfd_like *= w
+            # illustrative mismatch destabilization contribution; not a measured ΔG
+            destabilization = {"G:T":0.5,"U:G":0.5}.get(f"{r}:{d}",0.8)
+            pos_mult = 0.75 + 0.025*i
+            ddg_proxy += destabilization*pos_mult
+            mismatches.append({
+                "위치 (1= PAM-distal, 20=PAM-proximal)":i,
+                "gRNA 염기 (RNA)":r,
+                "표적 DNA 염기":d.replace("U","T"),
+                "미스매치":f"r{r}:d{d.replace('U','T')}",
+                "영역":"PAM-proximal" if i>=11 else "PAM-distal",
+                "교육용 위치가중치":round(w,3)
             })
-    return out
-
-def analyze(target, guide, pam_ok=True):
-    mm = mismatch_details(target, guide)
-    n = len(target)
-    # CFD-like educational score. Not the published CFD model.
-    mismatch_load = sum(x["heuristic_penalty"] for x in mm)
-    score = 100 * np.exp(-0.34 * mismatch_load)
-    score = float(np.clip(score, 0, 100))
-    ddg = float(sum(x["heuristic_ddG"] for x in mm))
-    # Relative duplex stability proxy: higher penalty -> less stable than perfect match.
-    stability = float(100 * np.exp(-0.28 * ddg))
-    if not pam_ok:
-        score *= 0.05
-    # A separate qualitative cleavage-associated index; not a probability.
-    cleavage_index = score * (0.65 + 0.35 * stability / 100)
+    pam_ok = bool(re.fullmatch(r"[ACGT]GG", pam))
     return {
-        "mismatch_count": len(mm),
-        "mismatch_positions": ", ".join(str(x["position"]) for x in mm) if mm else "없음",
-        "mismatch_types": ", ".join(x["mismatch"] for x in mm) if mm else "완전 일치",
-        "PAM": "NGG (입력 확인)" if pam_ok else "미확인/부적합",
-        "CFD-like score": round(score, 2),
-        "ΔΔG heuristic (kcal/mol)": round(ddg, 2),
-        "상대 안정성 지표": round(stability, 2),
-        "절단 관련 지표": round(cleavage_index, 2),
-        "_details": mm
+        "미스매치 수":len(mismatches),
+        "미스매치 위치":", ".join(str(x["위치 (1= PAM-distal, 20=PAM-proximal)"]) for x in mismatches) or "없음",
+        "PAM":pam,
+        "PAM 적합성": "NGG" if pam_ok else "NGG 아님",
+        "CFD 대체 지표":round(cfd_like,4) if pam_ok else 0.0,
+        "ΔΔG 불안정성 대리지표":round(ddg_proxy,3),
+        "상세":mismatches
     }
 
-def example_data():
-    target = "GAGTCCGAGCAGAAGAAGA A".replace(" ", "")
-    # 20 nt sequences; guide is entered in DNA alphabet (T) or RNA alphabet (U).
-    examples = [
-        ("gRNA_완전일치", target),
-        ("gRNA_G-T_미스매치", target[:9] + ("A" if target[9] != "A" else "C") + target[10:]),
-        ("gRNA_PAM원거리_1개", ("A" if target[1] != "A" else "C") + target[1:]),
-        ("gRNA_다중미스매치", target[:4] + ("A" if target[4] != "A" else "C") + target[5:13] + ("T" if target[13] != "T" else "G") + target[14:]),
-    ]
-    return target, examples
+st.subheader("1. 서열 입력")
+col1,col2=st.columns(2)
+with col1:
+    target_input=st.text_input("표적 DNA protospacer (20 nt, 5′→3′)", "GAGTCCGAGCAGAAGAAGAA")
+    pam_input=st.text_input("표적 부위 PAM (3 nt)", "AGG")
+with col2:
+    guides_input=st.text_area("gRNA 후보군 (RNA, 후보마다 한 줄: 이름,서열)", 
+"""gRNA-완전일치,GAGUCCGAGCAGAAGAAGAA
+gRNA-GU-예시,GAGUCCGAGUAGAAGAAGAA
+gRNA-원거리-1개, AAGUCCGAGCAGAAGAAGAA
+gRNA-다중미스매치,GAGUACGAGCAGAU GAAGAA""", height=160)
 
-with st.sidebar:
-    st.header("분석 설정")
-    pam_status = st.selectbox("PAM 조건", ["NGG 존재한다고 가정", "PAM 미확인"], index=0)
-    st.caption("현재 버전은 20 nt protospacer 비교를 기본으로 합니다. PAM은 별도 확인값으로 처리합니다.")
-    st.divider()
-    st.markdown("**서열 입력 규칙**")
-    st.write("- 표적 DNA: 5′→3′ 방향의 20 nt protospacer")
-    st.write("- gRNA: 표적 DNA와 같은 서열 방향으로 입력 (T 또는 U 허용)")
-    st.write("- PAM은 protospacer 뒤쪽의 NGG라고 가정")
+st.caption("※ 위 예시는 시연용 가상 서열입니다. gRNA 서열에는 T가 아닌 U를 사용합니다.")
+if st.button("분석 실행", type="primary", use_container_width=True):
+    try:
+        target=clean_dna(target_input)
+        pam=clean_dna(pam_input)
+        if len(pam)!=3: raise ValueError("PAM은 3 nt여야 합니다.")
+        records=[]
+        for line_no,line in enumerate(guides_input.splitlines(), start=1):
+            if not line.strip(): continue
+            if "," not in line: raise ValueError(f"{line_no}번째 줄은 '이름,서열' 형식이어야 합니다.")
+            name,seq=line.split(",",1)
+            guide=clean_rna(seq)
+            result=analyze(target,guide,pam)
+            records.append({"후보":name.strip(),"gRNA (RNA)":guide,**{k:v for k,v in result.items() if k!="상세"}})
+        if not records: raise ValueError("gRNA 후보를 한 개 이상 입력하세요.")
+        df=pd.DataFrame(records).sort_values("CFD 대체 지표",ascending=False)
+        st.subheader("2. 후보별 비교 결과")
+        st.dataframe(df,use_container_width=True,hide_index=True)
+        st.bar_chart(df.set_index("후보")[["CFD 대체 지표","ΔΔG 불안정성 대리지표"]])
+        st.subheader("3. 미스매치 상세")
+        for line_no,line in enumerate(guides_input.splitlines(), start=1):
+            if not line.strip(): continue
+            name,seq=line.split(",",1)
+            result=analyze(target,clean_rna(seq),pam)
+            with st.expander(f"{name.strip()} — 미스매치 {result['미스매치 수']}개"):
+                if result["상세"]:
+                    st.dataframe(pd.DataFrame(result["상세"]),use_container_width=True,hide_index=True)
+                else:
+                    st.success("표적 DNA와 완전 일치합니다.")
+        csv=df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("CSV 결과 다운로드",csv,"crispr_offtarget_comparison.csv","text/csv")
+    except Exception as e:
+        st.error(str(e))
 
-tab1, tab2 = st.tabs(["직접 입력", "가상 예제 데이터"])
-
-with tab1:
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        target_input = st.text_input("표적 DNA 서열 (20 nt)", value="GAGTCCGAGCAGAAGAAGAA")
-    with col2:
-        guides_input = st.text_area(
-            "gRNA 후보군 (후보마다 한 줄)",
-            value="gRNA_A, GAGTCCGAGCAGAAGAAGAA\ngRNA_B, GAGTCCGAGTAGAAGAAGAA\ngRNA_C, AAGTCCGAGCAGAAGAAGAA",
-            height=130
-        )
-    run_manual = st.button("후보 분석 실행", type="primary", use_container_width=True)
-
-with tab2:
-    st.write("실제 측정 데이터가 아닌, 미스매치 위치와 종류에 따른 결과 차이를 확인하기 위한 가상 데이터입니다.")
-    if st.button("가상 데이터 불러오기", use_container_width=True):
-        ex_target, ex_guides = example_data()
-        st.session_state["example_target"] = ex_target
-        st.session_state["example_guides"] = ex_guides
-    if "example_target" in st.session_state:
-        st.code(f"표적 DNA: {st.session_state['example_target']}")
-        for name, seq in st.session_state["example_guides"]:
-            st.code(f"{name}, {seq}")
-        if st.button("가상 데이터 분석 실행", type="primary", use_container_width=True):
-            st.session_state["run_example"] = True
-
-def run_analysis(target, lines):
-    target = clean_seq(target)
-    if len(target) != 20:
-        st.error(f"표적 DNA는 현재 20 nt여야 합니다. 입력 길이: {len(target)} nt")
-        return
-    parsed = []
-    for idx, line in enumerate(lines, start=1):
-        if not line.strip():
-            continue
-        if "," in line:
-            name, seq = line.split(",", 1)
-        else:
-            name, seq = f"gRNA_{idx}", line
-        seq = clean_seq(seq)
-        if len(seq) != 20:
-            st.warning(f"{name.strip()}: 길이가 20 nt가 아니어서 제외했습니다 ({len(seq)} nt).")
-            continue
-        result = analyze(target, seq, pam_status == "NGG 존재한다고 가정")
-        result["후보"] = name.strip()
-        result["gRNA 서열"] = seq
-        parsed.append(result)
-    if not parsed:
-        st.error("분석 가능한 20 nt gRNA 후보가 없습니다.")
-        return
-    df = pd.DataFrame(parsed).sort_values("절단 관련 지표", ascending=False)
-    st.subheader("분석 결과")
-    display_cols = ["후보", "gRNA 서열", "mismatch_count", "mismatch_positions", "mismatch_types",
-                    "PAM", "CFD-like score", "ΔΔG heuristic (kcal/mol)", "상대 안정성 지표", "절단 관련 지표"]
-    st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**후보별 CFD-like 점수**")
-        chart = df.set_index("후보")[["CFD-like score"]]
-        st.bar_chart(chart)
-    with c2:
-        st.markdown("**후보별 열역학적 불안정성 추정치**")
-        chart2 = df.set_index("후보")[["ΔΔG heuristic (kcal/mol)"]]
-        st.bar_chart(chart2)
-    st.subheader("미스매치 위치 분석")
-    for _, row in df.iterrows():
-        with st.expander(f"{row['후보']} — 미스매치 {row['mismatch_count']}개"):
-            if not row["_details"]:
-                st.success("표적 DNA와 완전히 일치합니다.")
-            else:
-                detail_df = pd.DataFrame(row["_details"])
-                st.dataframe(detail_df[["position", "target_base", "guide_base", "mismatch", "region",
-                                        "heuristic_penalty", "heuristic_ddG"]], hide_index=True, use_container_width=True)
-    csv = df[display_cols].to_csv(index=False).encode("utf-8-sig")
-    st.download_button("분석 결과 CSV 다운로드", csv, "crispr_offtarget_results.csv", "text/csv")
-    st.caption("해석 주의: ΔΔG heuristic은 교육용 가중치 합산값이며 실측 자유에너지 변화가 아닙니다. CFD-like score 역시 논문 원본 CFD 점수가 아닙니다. 두 지표 모두 절단 확률(%)이 아닙니다.")
-
-if run_manual:
-    run_analysis(target_input, guides_input.splitlines())
-
-if st.session_state.get("run_example", False):
-    ex_target = st.session_state["example_target"]
-    ex_lines = [f"{name}, {seq}" for name, seq in st.session_state["example_guides"]]
-    run_analysis(ex_target, ex_lines)
-    st.session_state["run_example"] = False
-
-st.divider()
-st.markdown("**모델의 범위와 한계**")
-st.write(
-    "이 프로토타입은 표적 DNA와 gRNA의 서열 정렬을 시연합니다. 실제 GUIDE-seq/Digenome-seq 결과, "
-    "검증된 CFD lookup table, RNA-DNA nearest-neighbor thermodynamic parameters, "
-    "Cas9 구조·동역학 데이터는 포함하지 않습니다. 따라서 실험적 오프타겟 검증을 대체하지 않습니다."
-)
+st.subheader("4. 점수 해석과 모델의 한계")
+st.markdown("""
+- **CFD 대체 지표:** 실제 Doench et al. CFD가 아닙니다. 공개된 CFD 행렬 전체를 내장하지 않은 상태에서 설명용 가중치로 산출한 비교 지표입니다. 논문 CFD 점수로 인용하면 안 됩니다.
+- **ΔΔG 불안정성 대리지표:** 실측 kcal/mol 단위의 자유에너지 변화가 아닙니다. 실제 RNA-DNA nearest-neighbor 파라미터를 적용한 열역학 계산도 아니므로 숫자를 ΔΔG(kcal/mol)로 해석하지 않습니다.
+- **PAM:** 입력한 PAM이 NGG인지 확인합니다. 이 앱은 전체 유전체를 검색하지 않으며, 입력한 표적 자리와 후보 gRNA 간 서열 차이만 비교합니다.
+- **구조적 활성화:** REC3, L1/L2, HNH, RuvC의 구조 변화나 절단 반응속도론을 직접 계산하지 않습니다.
+- **결론:** 결과는 후보 간 교육용 상대 비교이며, 절단 확률(%) 또는 생물학적 안전성 판정이 아닙니다.
+""")
+st.markdown("**정확한 CFD로 확장하려면:** Doench et al. 2016 Supplementary Table 19의 position-specific RNA:DNA mismatch activity 값을 불러와 각 미스매치 가중치를 곱해야 합니다. CFD는 각 미스매치 위치·염기 조합별 실험 유래 가중치의 곱으로 계산됩니다.")
+st.caption("참고: Doench et al., Nature Biotechnology (2016), Optimized sgRNA design to maximize activity and minimize off-target effects of CRISPR-Cas9.")
